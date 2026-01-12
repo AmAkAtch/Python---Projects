@@ -21,8 +21,8 @@ int_to_char = dict((index,char) for index,char in enumerate(chars))
 for i in range(0, len(raw_text)-seq_length, 1):
     seq_in = raw_text[i:i+seq_length]
     seq_out = raw_text[i+seq_length]
-    dataX.append(seq_in)
-    dataY.append(seq_out)
+    dataX.append([char_to_ind[char] for char in seq_in])
+    dataY.append(char_to_ind[seq_out])
 
 n_patterns = len(dataX)
 
