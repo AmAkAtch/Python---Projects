@@ -28,3 +28,14 @@ class TradingViewBot:
         input_email.send_keys(self.EMAIL)
         input_password = WebDriverWait(self.driver,15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[id='id_password']")))
         input_password.send_keys(self.PASSWORD, Keys.ENTER)
+
+        #Check if captcha is present
+        try:
+            captcha_box = WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.TAG_NAME, "iframe"))
+            )
+            input("Captcha found, solve it and than proceed....")
+        except:
+            print("No captcha is present, Proceeding...")
+
+        
