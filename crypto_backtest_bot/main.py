@@ -9,12 +9,12 @@ from numba import njit
 from datetime import datetime
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. DYNAMIC CONFIGURATION
 # ==========================================
 if not os.path.exists('data'):
     os.makedirs('data')
 
-# Expanded Universe (Top Liquid Pairs)
+# Top Liquid Pairs
 COINS = [
     'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 
     'ADA/USDT', 'LINK/USDT', 'LTC/USDT', 'BCH/USDT', 'SUI/USDT', 
@@ -27,24 +27,19 @@ COINS = [
 ]
 
 TIMEFRAME = '1d'
-START_DATE = "2020-01-01 00:00:00"
+START_DATE = "2018-01-01 00:00:00" 
 
-# Optimization Settings
-TOTAL_TESTS = 3000000 # High count, but handled by Numba speed
+TOTAL_TESTS = 1000000 
 TRADING_FEE = 0.002 
 FIXED_TRADE_SIZE = 1000.0 
 
-# Weighted Scoring Configuration
-# We value recent years more. 
-# Format: (Year, Weight)
-YEAR_WEIGHTS = {
-    2020: 0.5,
-    2021: 0.8,
-    2022: 1.0, # Bear market survival is key
-    2023: 1.2,
-    2024: 1.5,
-    2025: 1.5
-}
+# Decay rate for recency weighting (0.25 = recent years are much more valuable)
+DECAY_RATE = 0.05 
+
+# Neighbor Check Settings
+# If the average neighbor score is less than 60% of the candidate score, 
+# we assume the candidate is a "lucky spike" and discard it.
+ROBUSTNESS_THRESHOLD = 0.60 
 
 RANGES = {
     'fast_rsi_len': (5, 60),       
@@ -53,10 +48,10 @@ RANGES = {
     'slow_smooth': (2, 70),        
     'trend_ma': (20, 250),        
     'atr_period': (14, 14),       
-    'atr_stop_mult': (1.5, 5.0),   
-    'atr_tp_mult': (15.0, 50.0),    
-    'atr_trail_mult': (1.5, 15.0),
-    'btc_filter_ma': (50, 250) # BTC Trend Filter MA length
+    'atr_stop_mult': (5, 10.0),   
+    'atr_tp_mult': (30.0, 80.0), 
+    'atr_trail_mult': (5, 10.0),
+    'btc_filter_ma': (60, 150) 
 }
 
 # ==========================================
@@ -126,22 +121,20 @@ def numba_atr(high, low, close, length):
     return numba_rma(tr, length)
 
 # ==========================================
-# 3. BACKTEST LOGIC (YEARLY TRACKING)
+# 3. BACKTEST LOGIC (UNCHANGED)
 # ==========================================
 @njit(fastmath=True)
 def backtest_yearly_runner(opens, highs, lows, closes, years, 
                            rsi_fast, rsi_slow, ma_trend, atr, btc_bullish,
                            tp_mult, sl_mult, trail_mult, trading_fee, start_idx):
     
-    # Yearly PnL Tracking (Year 2020 -> Index 2020)
-    # Using a fixed array size for years 2020-2030
-    yearly_pnl = np.zeros(3000) 
+    # Map years to index (2000 -> 0)
+    yearly_pnl = np.zeros(150) 
     
-    # Metrics
     total_trades = 0
-    winning_trades = 0
+    gross_win_dollars = 0.0
+    gross_loss_dollars = 0.0
     
-    # State
     in_pos = False
     half_sold = False 
     entry_price = 0.0
@@ -152,7 +145,8 @@ def backtest_yearly_runner(opens, highs, lows, closes, years,
     n = len(closes)
     
     for i in range(start_idx, n-1):
-        curr_year = int(years[i+1]) # Log PnL to the year the trade CLOSES or is active
+        yr_idx = int(years[i+1]) - 2000 
+        if yr_idx < 0: yr_idx = 0
         
         curr_open = opens[i+1]
         curr_high = highs[i+1]
@@ -160,26 +154,21 @@ def backtest_yearly_runner(opens, highs, lows, closes, years,
         curr_close = closes[i+1]
         curr_atr = atr[i]
         
-        # -----------------------------
         # 1. MANAGE POSITION
-        # -----------------------------
         if in_pos:
             net_pnl_event = 0.0
             
-            # --- A. TRAILING STOP UPDATE ---
+            # Trail Stop
             if half_sold:
                 potential_new_sl = curr_high - (curr_atr * trail_mult)
                 if potential_new_sl > stop_loss_price:
                     stop_loss_price = potential_new_sl
             
-            # --- B. CONSERVATIVE EXIT LOGIC ---
-            # If Low hits SL, we are OUT. Even if High hit TP in same candle.
-            # We assume worst case for manual trading safety.
+            # Check Exits
             sl_hit = curr_low <= stop_loss_price
             tp_hit = (not half_sold) and (curr_high >= tp_trigger_price)
             
             if sl_hit:
-                # Execution Price (Slippage logic: SL or Open)
                 exit_p = stop_loss_price
                 if curr_open < stop_loss_price: exit_p = curr_open 
                 
@@ -189,14 +178,16 @@ def backtest_yearly_runner(opens, highs, lows, closes, years,
                 fees = (cost_of_chunk + revenue) * trading_fee
                 
                 net_pnl_event = gross_pnl - fees
-                yearly_pnl[curr_year] += net_pnl_event
+                yearly_pnl[yr_idx] += net_pnl_event
+                
+                if net_pnl_event > 0: gross_win_dollars += net_pnl_event
+                else: gross_loss_dollars += abs(net_pnl_event)
                 
                 in_pos = False
                 half_sold = False
                 units = 0.0
                 
             elif tp_hit and not sl_hit:
-                # Take 50% Profit
                 sell_p = tp_trigger_price
                 if curr_open > tp_trigger_price: sell_p = curr_open 
                 
@@ -208,18 +199,16 @@ def backtest_yearly_runner(opens, highs, lows, closes, years,
                 fees = (cost_of_chunk + revenue) * trading_fee
                 
                 net_pnl_event = gross_pnl - fees
-                yearly_pnl[curr_year] += net_pnl_event
+                yearly_pnl[yr_idx] += net_pnl_event
                 
-                # Update State
+                if net_pnl_event > 0: gross_win_dollars += net_pnl_event
+                else: gross_loss_dollars += abs(net_pnl_event)
+                
                 units -= units_to_sell 
                 half_sold = True
-                # Move SL to Breakeven
                 if stop_loss_price < entry_price:
                     stop_loss_price = entry_price
-                
-                winning_trades += 1 # Count as win once we bank profit
             
-            # --- C. STRATEGY EXIT (Indicator Crossunder) ---
             else:
                 crossunder = (rsi_fast[i-1] >= rsi_slow[i-1]) and (rsi_fast[i] < rsi_slow[i])
                 if crossunder:
@@ -229,51 +218,39 @@ def backtest_yearly_runner(opens, highs, lows, closes, years,
                     fees = (cost_of_chunk + revenue) * trading_fee
                     
                     net_pnl_event = gross_pnl - fees
-                    yearly_pnl[curr_year] += net_pnl_event
+                    yearly_pnl[yr_idx] += net_pnl_event
                     
-                    if gross_pnl > 0: winning_trades += 1 # Only count win if net positive
+                    if net_pnl_event > 0: gross_win_dollars += net_pnl_event
+                    else: gross_loss_dollars += abs(net_pnl_event)
 
                     in_pos = False
                     half_sold = False
                     units = 0.0
 
-        # -----------------------------
         # 2. CHECK ENTRY
-        # -----------------------------
-        # Only enter if:
-        # 1. Not in Position
-        # 2. Signal Exists (RSI Cross)
-        # 3. Trend is Bullish (Price > MA)
-        # 4. MARKET FILTER: BTC is Bullish (Passed in array)
-        
         if not in_pos:
             crossover = (rsi_fast[i-1] <= rsi_slow[i-1]) and (rsi_fast[i] > rsi_slow[i])
             trend_bullish = closes[i] > ma_trend[i]
-            
-            # BTC Filter Check
             market_bullish = btc_bullish[i] == 1.0
             
             if crossover and trend_bullish and market_bullish:
                 entry_price = curr_open
                 units = FIXED_TRADE_SIZE / entry_price
-                
                 stop_loss_price = entry_price - (curr_atr * sl_mult)
                 tp_trigger_price = entry_price + (curr_atr * tp_mult)
-                
                 in_pos = True
                 half_sold = False
                 total_trades += 1
             
-    return yearly_pnl, total_trades, winning_trades
+    return yearly_pnl, total_trades, gross_win_dollars, gross_loss_dollars
 
 # ==========================================
-# 4. DATA FETCHING & PROCESSING
+# 4. DATA FETCHING
 # ==========================================
 def fetch_full_history(symbol, start_date_str):
     safe_sym = symbol.replace('/', '_')
     fname = f"data/{safe_sym}_{TIMEFRAME}_full.csv"
     
-    # Check if exists
     if os.path.exists(fname):
         return pd.read_csv(fname)
     
@@ -300,38 +277,150 @@ def fetch_full_history(symbol, start_date_str):
         return None
 
 def prepare_btc_filter():
-    # Ensures we have BTC data to act as the global filter
+    print("Preparing BTC Trend Filter...")
     df_btc = fetch_full_history('BTC/USDT', START_DATE)
+    if df_btc is None: return None
     df_btc['timestamp'] = pd.to_datetime(df_btc['timestamp'], unit='ms')
     df_btc = df_btc.set_index('timestamp').resample('1D').ffill()
-    return df_btc['close'] # Return Series
+    return df_btc['close']
 
 # ==========================================
-# 5. OPTIMIZER CORE (ROBUSTNESS FOCUSED)
+# 5. CORE EVALUATOR (Extracted for Neighbour Checking)
+# ==========================================
+def evaluate_params(p, market_data, valid_coins, yearly_weights, min_year, max_year):
+    """
+    Runs the backtest for a specific parameter set across all coins.
+    Returns: Final Score (Float) or -999 if invalid
+    """
+    if p['f_len'] >= p['s_len']: return -999, {}
+    
+    global_yearly_pnl = {y: 0.0 for y in range(min_year, max_year + 1)}
+    
+    total_trades_all = 0
+    total_gross_win = 0.0
+    total_gross_loss = 0.0
+    valid_runs = 0
+    
+    for coin in valid_coins:
+        d = market_data[coin]
+        warmup = max(p['s_len'] + p['s_smt'], p['ma'], p['btc_ma']) + 2
+        if len(d['c']) <= warmup: continue
+        
+        # Calc Indicators
+        rsi_f = numba_sma(numba_rsi(d['c'], p['f_len']), p['f_smt'])
+        rsi_s = numba_sma(numba_rsi(d['c'], p['s_len']), p['s_smt'])
+        ma = numba_sma(d['c'], p['ma'])
+        atr = numba_atr(d['h'], d['l'], d['c'], p['atr_per'])
+        
+        btc_ma = numba_sma(d['btc_close'], p['btc_ma'])
+        btc_bullish = np.where(d['btc_close'] > btc_ma, 1.0, 0.0)
+        
+        yearly_res, trades, g_win, g_loss = backtest_yearly_runner(
+            d['o'], d['h'], d['l'], d['c'], d['y'],
+            rsi_f, rsi_s, ma, atr, btc_bullish,
+            p['tp_m'], p['sl_m'], p['tr_m'], 
+            TRADING_FEE, int(warmup)
+        )
+        
+        total_trades_all += trades
+        total_gross_win += g_win
+        total_gross_loss += g_loss
+        valid_runs += 1
+        
+        for y in range(min_year, max_year + 1):
+            y_idx = y - 2000
+            if 0 <= y_idx < 150:
+                global_yearly_pnl[y] += yearly_res[y_idx]
+
+    if valid_runs == 0 or total_trades_all < 50: 
+        return -999, {}
+
+    # --- SCORING ---
+    pf = total_gross_win / total_gross_loss if total_gross_loss > 0 else 10.0
+    if pf < 1.05: return -999, {}
+
+    # "Kill Switch" (Trailing 3 Years)
+    recent_years = [max_year, max_year-1, max_year-2]
+    yearly_loss_limit = -(FIXED_TRADE_SIZE * 0.5) 
+    
+    for y in recent_years:
+        if y in global_yearly_pnl and global_yearly_pnl[y] < yearly_loss_limit:
+            return -999, {} # Failed Kill Switch
+
+    weighted_pnl = 0.0
+    for y in range(min_year, max_year + 1):
+        weighted_pnl += (global_yearly_pnl[y] * yearly_weights[y])
+        
+    final_score = weighted_pnl * pf
+    
+    metrics = {
+        'pf': pf,
+        'trades': total_trades_all,
+        'yearly_pnl': global_yearly_pnl
+    }
+    
+    return final_score, metrics
+
+# ==========================================
+# 6. NEIGHBOR GENERATOR
+# ==========================================
+def get_neighbors(p):
+    """
+    Generates 8 variations of the parameter set to test stability.
+    """
+    neighbors = []
+    
+    # Neighbor 1 & 2: Adjust RSI Lengths
+    n1 = p.copy(); n1['f_len'] = max(5, n1['f_len'] - 2); n1['s_len'] = max(10, n1['s_len'] - 3)
+    neighbors.append(n1)
+    n2 = p.copy(); n2['f_len'] = n2['f_len'] + 2; n2['s_len'] = n2['s_len'] + 3
+    neighbors.append(n2)
+    
+    # Neighbor 3 & 4: Adjust Trend MA
+    n3 = p.copy(); n3['ma'] = int(n3['ma'] * 0.95)
+    neighbors.append(n3)
+    n4 = p.copy(); n4['ma'] = int(n4['ma'] * 1.05)
+    neighbors.append(n4)
+    
+    # Neighbor 5 & 6: Adjust Risk Multipliers
+    n5 = p.copy(); n5['sl_m'] = max(1.1, n5['sl_m'] - 0.2); n5['tp_m'] = n5['tp_m'] - 0.5
+    neighbors.append(n5)
+    n6 = p.copy(); n6['sl_m'] = n6['sl_m'] + 0.2; n6['tp_m'] = n6['tp_m'] + 0.5
+    neighbors.append(n6)
+
+    # Neighbor 7 & 8: Adjust BTC Filter
+    n7 = p.copy(); n7['btc_ma'] = int(n7['btc_ma'] * 0.9)
+    neighbors.append(n7)
+    n8 = p.copy(); n8['btc_ma'] = int(n8['btc_ma'] * 1.1)
+    neighbors.append(n8)
+    
+    return neighbors
+
+# ==========================================
+# 7. OPTIMIZER MAIN
 # ==========================================
 def optimize():
-    # 1. PREPARE DATA
     print("\n--- 1. LOADING & ALIGNING DATA ---")
     
-    # Load BTC for Market Filter
     btc_series = prepare_btc_filter()
+    if btc_series is None: return
     
     market_data = {}
     valid_coins = []
+    max_year_found = 0
+    min_year_found = 2100
     
     for coin in COINS:
         df = fetch_full_history(coin, START_DATE)
         if df is None or len(df) < 500: continue
         
-        # Pre-calculate Years for indexing
         df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
         df['year'] = df['datetime'].dt.year
         
-        # Align BTC Filter to this coin's timeline
-        # We need to look up BTC close for every timestamp in this coin's DF
-        # Efficient way: Map timestamps
+        curr_max = df['year'].max(); curr_min = df['year'].min()
+        if curr_max > max_year_found: max_year_found = curr_max
+        if curr_min < min_year_found: min_year_found = curr_min
         
-        # Convert to arrays
         d = {
             'o': df['open'].values.astype(np.float64),
             'h': df['high'].values.astype(np.float64),
@@ -341,7 +430,6 @@ def optimize():
             'ts': df['timestamp'].values
         }
         
-        # Reindex BTC to match this coin exactly
         coin_dates = df['datetime']
         aligned_btc = btc_series.reindex(coin_dates).fillna(method='ffill').values
         d['btc_close'] = aligned_btc.astype(np.float64)
@@ -349,16 +437,29 @@ def optimize():
         market_data[coin] = d
         valid_coins.append(coin)
 
-    print(f"Loaded {len(valid_coins)} coins for testing.")
-    print("Optimization Strategy: Consistency Weighted Scoring")
+    print(f"Loaded {len(valid_coins)} coins. Time Window: {min_year_found}-{max_year_found}")
+    
+    # Generate Dynamic Weights
+    yearly_weights = {}
+    print("\n--- DYNAMIC RECENCY WEIGHTS ---")
+    for y in range(min_year_found, max_year_found + 1):
+        if y != max_year_found:
+            age = max_year_found - y -1
+            weight = 1.0 / ((1 + DECAY_RATE) ** age)
+        else:
+            weight = 0.1
+        yearly_weights[y] = weight
+        print(f"Year {y}: {weight:.3f}")
+        
+    print(f"\nOptimization Mode: Neighbor Robustness Check > {ROBUSTNESS_THRESHOLD*100}% Stability")
     
     best_score = -999999
     best_params = None
     
     # 2. OPTIMIZATION LOOP
-    for _ in tqdm(range(TOTAL_TESTS)):
+    for i in tqdm(range(TOTAL_TESTS)):
         
-        # A. Generate Random Params
+        # A. Random Candidate
         p = {
             'f_len': random.randint(*RANGES['fast_rsi_len']),
             'f_smt': random.randint(*RANGES['fast_smooth']),
@@ -372,105 +473,50 @@ def optimize():
             'btc_ma': random.randint(*RANGES['btc_filter_ma'])
         }
         
-        if p['f_len'] >= p['s_len']: continue
+        score, metrics = evaluate_params(p, market_data, valid_coins, yearly_weights, min_year_found, max_year_found)
         
-        # Global Aggregators
-        global_yearly_pnl = {} # {2020: 0.0, 2021: 0.0 ...}
-        total_trades_all = 0
-        total_wins_all = 0
-        
-        valid_runs = 0
-        
-        # B. Test Across Universe
-        for coin in valid_coins:
-            d = market_data[coin]
+        # B. Check if Potential New Best
+        if score > best_score:
             
-            # Warmup check
-            warmup = max(p['s_len'] + p['s_smt'], p['ma'], p['btc_ma']) + 2
-            if len(d['c']) <= warmup: continue
+            # C. THE NEIGHBOR CHECK (Stability Filter)
+            # Before accepting, we test the neighbors.
+            neighbors = get_neighbors(p)
+            neighbor_scores = []
             
-            # Calculate Indicators
-            rsi_f = numba_sma(numba_rsi(d['c'], p['f_len']), p['f_smt'])
-            rsi_s = numba_sma(numba_rsi(d['c'], p['s_len']), p['s_smt'])
-            ma = numba_sma(d['c'], p['ma'])
-            atr = numba_atr(d['h'], d['l'], d['c'], p['atr_per'])
+            valid_neighbors = 0
             
-            # BTC Filter Calculation
-            btc_ma = numba_sma(d['btc_close'], p['btc_ma'])
-            # Boolean array: 1.0 if BTC > MA, else 0.0
-            # Handle NaNs in BTC MA
-            btc_bullish = np.where(d['btc_close'] > btc_ma, 1.0, 0.0)
+            for np_params in neighbors:
+                n_score, _ = evaluate_params(np_params, market_data, valid_coins, yearly_weights, min_year_found, max_year_found)
+                if n_score > -900: # If neighbor isn't completely broken
+                    neighbor_scores.append(n_score)
             
-            # Run Backtest
-            yearly_res, trades, wins = backtest_yearly_runner(
-                d['o'], d['h'], d['l'], d['c'], d['y'],
-                rsi_f, rsi_s, ma, atr, btc_bullish,
-                p['tp_m'], p['sl_m'], p['tr_m'], 
-                TRADING_FEE, int(warmup)
-            )
-            
-            total_trades_all += trades
-            total_wins_all += wins
-            valid_runs += 1
-            
-            # Aggregate Yearly PnL
-            # yearly_res is an array index 0-3000. 2020 is at index 2020.
-            for y in range(2020, 2026):
-                if y not in global_yearly_pnl: global_yearly_pnl[y] = 0.0
-                global_yearly_pnl[y] += yearly_res[y]
-
-        if valid_runs == 0: continue
-        if total_trades_all < 50: continue # Must trade enough to be significant
-        
-        # C. SCORING MECHANISM (The "Window" Logic)
-        
-        # 1. Winrate Check
-        wr = total_wins_all / total_trades_all
-        if wr < 0.40: continue # Hard filter: If winrate < 40%, discard (user wants high winrate)
-        
-        # 2. Consistency Check (The "No Loser Year" Rule)
-        # We allow small losses, but massive drawdown years disqualify the strat.
-        # Actually, let's enforce STRICT consistency: 
-        # Weighted Score = Sum(YearPnL * YearWeight)
-        # PENALTY: If any year is negative, divide score by 10.
-        
-        weighted_score = 0.0
-        has_negative_year = False
-        
-        years_active = [y for y in global_yearly_pnl if global_yearly_pnl[y] != 0]
-        if len(years_active) < 3: continue # Must have traded in at least 3 years
-        
-        for y in range(2020, 2026):
-            pnl = global_yearly_pnl.get(y, 0.0)
-            weight = YEAR_WEIGHTS.get(y, 1.0)
-            
-            if pnl < -500: # Allow small drawback, but punish losses > $500
-                has_negative_year = True
-            
-            weighted_score += (pnl * weight)
-            
-        if has_negative_year:
-            weighted_score = -1000 # Disqualify immediately
-            
-        # 3. Final Score Adjustment
-        # Prefer higher winrate.
-        # Score = Weighted PnL * WinRate
-        final_score = weighted_score * wr
-        
-        if final_score > best_score:
-            best_score = final_score
-            best_params = p
-            
-            # Create a pretty string for yearly breakdown
-            breakdown = " | ".join([f"{y}:${int(global_yearly_pnl.get(y,0))}" for y in range(2020, 2025)])
-            
-            print(f"\nNEW BEST! Score: {final_score:.0f} | WR: {wr*100:.1f}% | Trades: {total_trades_all}")
-            print(f"Yearly: {breakdown}")
-            print(f"Params: RSI {p['f_len']}/{p['s_len']} ({p['f_smt']}/{p['s_smt']}) | MA {p['ma']} | BTC_MA {p['btc_ma']}")
-            print(f"Risk: TP {p['tp_m']:.1f} | SL {p['sl_m']:.1f} | Trail {p['tr_m']:.1f}")
+            if len(neighbor_scores) > 0:
+                avg_neighbor_score = sum(neighbor_scores) / len(neighbor_scores)
+                
+                # STABILITY LOGIC:
+                # The neighbors must perform at least X% as well as the candidate.
+                # Example: If Candidate Score is 1000, Avg Neighbor must be > 600.
+                stability_ratio = avg_neighbor_score / score
+                
+                if stability_ratio >= ROBUSTNESS_THRESHOLD:
+                    # PASSED! It's a robust mountain top, not a lucky spike.
+                    best_score = score
+                    best_params = p
+                    
+                    display_years = sorted(list(metrics['yearly_pnl'].keys()))[-9:]
+                    breakdown = " | ".join([f"{y}:${int(metrics['yearly_pnl'][y])}" for y in display_years])
+                    
+                    print(f"\nNEW ROBUST BEST! Score: {score:.0f} (Stability: {stability_ratio*100:.0f}%)")
+                    print(f"PF: {metrics['pf']:.2f} | Trades: {metrics['trades']}")
+                    print(f"Breakdown: {breakdown}")
+                    print(f"Params: Fast RSI {p['f_len']}/{p['f_smt']} | Slow RSI {p['s_len']}/{p['s_smt']} | MA {p['ma']} | BTC {p['btc_ma']}")
+                    print(f"Risk: TP {p['tp_m']:.1f} | SL {p['sl_m']:.1f} | Trail {p['tr_m']:.1f}")
+                
+                # else: 
+                #     print(f"Rejected Lucky Spike. Score {score}, but Neighbors {avg_neighbor_score}")
 
     print("\nOPTIMIZATION COMPLETE")
-    print("Best Parameters:", best_params)
+    print("Best Robust Parameters:", best_params)
 
 if __name__ == "__main__":
     optimize()
