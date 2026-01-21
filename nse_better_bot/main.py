@@ -31,12 +31,13 @@ NIFTY_UNIVERSE = [
     'MARICO.NS', 'IOC.NS', 'TORNTPHARM.NS', 'PIIND.NS', 'NAUKRI.NS', 'HAL.NS', 'TRENT.NS', 
     'TVSMOTOR.NS', 'ZOMATO.NS', 'VBL.NS', 'ABB.NS', 'PAGEIND.NS', 'COLPAL.NS',
     
-    # --- HIGH MOMENTUM MIDCAPS (The "Juice" for Moving Averages) ---
+    # --- HIGH MOMENTUM MIDCAPS ---
     'POLYCAB.NS', 'DIXON.NS', 'PERSISTENT.NS', 'LTIM.NS', 'KPITTECH.NS', 'COFORGE.NS',
     'ASTRAL.NS', 'BALKRISIND.NS', 'FEDERALBNK.NS', 'IDFCFIRSTB.NS', 'ASHOKLEY.NS',
     'CUMMINSIND.NS', 'OBEROIRLTY.NS', 'ESCORTS.NS', 'JUBLFOOD.NS', 'MRF.NS', 'MUTHOOTFIN.NS',
     'PETRONET.NS', 'PFC.NS', 'RECLTD.NS', 'SHRIRAMFIN.NS', 'TATACHEM.NS', 'TATAPOWER.NS',
-    'VOLTAS.NS', 'ZEEL.NS', 'AUROPHARMA.NS', 'LUPIN.NS', 'ALKEM.NS', 'BHEL.NS', 'SAIL.NS'
+    'VOLTAS.NS', 'ZEEL.NS', 'AUROPHARMA.NS', 'LUPIN.NS', 'ALKEM.NS', 'BHEL.NS', 'SAIL.NS',
+    'BSE.NS', 'ANGELONE.NS', 'MCX.NS'
 ]
 
 START_DATE = "2015-01-01"
@@ -44,16 +45,16 @@ NUM_ITERATIONS = 100000
 MIN_TRADES_REQUIRED = 50     
 COST_PCT = 0.0020  # 0.20% Slippage/Tax
 
-# SCORING SETTINGS (Crypto Logic)
-DECAY_RATE = 0.10          # High recency bias
+# SCORING SETTINGS
+DECAY_RATE = 0.10          # High recency bias (10% decay)
 ROBUSTNESS_THRESHOLD = 0.70 
-MAX_YEAR_DRAWDOWN = -0.15   # Kill switch
+MAX_YEAR_DRAWDOWN = -0.15   # Kill switch (-15% portfolio loss limit)
 
 if not os.path.exists("data"):
     os.makedirs("data")
 
 # ==========================================
-# 2. DATA LOADING (BUG FIXED 🔧)
+# 2. DATA LOADING
 # ==========================================
 def get_stock_data(ticker):
     file_path = f"data/{ticker}.csv"
@@ -61,17 +62,17 @@ def get_stock_data(ticker):
     # Try loading from CSV first
     if os.path.exists(file_path):
         try:
-            # FIX: Explicitly tell Pandas to parse the 'Date' column and make it the index
+            # Explicitly parse dates
             df = pd.read_csv(file_path, parse_dates=['Date'], index_col='Date')
             return df
-        except Exception as e:
-            pass # If fail, re-download
+        except Exception:
+            pass 
 
-    # Download if missing or broken
+    # Download if missing
     try:
         df = yf.download(ticker, start=START_DATE, progress=False, multi_level_index=False)
         if len(df) > 200:
-            df.to_csv(file_path) # Saves with 'Date' column
+            df.to_csv(file_path)
             return df
     except Exception: return None
     return None
@@ -103,7 +104,7 @@ def calc_sma(prices, period):
     return sma
 
 # ==========================================
-# 4. BACKTEST LOGIC
+# 4. BACKTEST LOGIC (Updated for PF Calculation)
 # ==========================================
 @njit(fastmath=True)
 def backtest_logic_yearly(opens, highs, lows, closes, years,
@@ -113,6 +114,10 @@ def backtest_logic_yearly(opens, highs, lows, closes, years,
     
     # PnL array: Index 0 = min_year, Index 1 = min_year+1...
     yearly_pnl = np.zeros(30, dtype=np.float64) 
+    
+    # Track Gross Wins/Losses for Profit Factor
+    total_win_pct = 0.0
+    total_loss_pct = 0.0
     
     n = len(closes)
     in_pos = False
@@ -133,7 +138,10 @@ def backtest_logic_yearly(opens, highs, lows, closes, years,
         if yr_idx < 0: yr_idx = 0
         if yr_idx >= 30: yr_idx = 29
         
-        # --- EXIT ---
+        curr_open = opens[i+1]
+        curr_low = lows[i+1]
+        
+        # --- EXIT LOGIC ---
         if in_pos:
             high_since_entry = max(high_since_entry, highs[i+1])
             should_exit = False
@@ -142,40 +150,49 @@ def backtest_logic_yearly(opens, highs, lows, closes, years,
             # Trailing Stop
             if use_trailing:
                 stop_price = high_since_entry * (1.0 - trail_pct / 100.0)
-                if lows[i+1] <= stop_price:
+                if curr_low <= stop_price:
                     should_exit = True
-                    exit_price = opens[i+1] if opens[i+1] < stop_price else stop_price
+                    exit_price = curr_open if curr_open < stop_price else stop_price
             
             # Crossover Exit
             if not should_exit:
                 if short_ma[i-1] >= long_ma[i-1] and short_ma[i] < long_ma[i]:
                     should_exit = True
-                    exit_price = opens[i+1]
+                    exit_price = curr_open
             
             if should_exit:
                 pnl = (exit_price - entry_price) / entry_price - COST_PCT
                 yearly_pnl[yr_idx] += pnl
                 trades += 1
-                if pnl > 0: wins += 1
+                
+                # Accumulate for PF
+                if pnl > 0: 
+                    wins += 1
+                    total_win_pct += pnl
+                else:
+                    total_loss_pct += abs(pnl)
+                
                 in_pos = False
                 high_since_entry = 0.0
 
-        # --- ENTRY ---
+        # --- ENTRY LOGIC ---
         elif not in_pos:
             crossover = short_ma[i-1] <= long_ma[i-1] and short_ma[i] > long_ma[i]
             trend_ok = True
+            
+            # Filters
             if filter_mode == 1 and closes[i] <= super_ma[i]: trend_ok = False
             if filter_mode == 2 and closes[i] >= super_ma[i]: trend_ok = False
             
             if crossover and trend_ok:
                 in_pos = True
-                entry_price = opens[i+1]
-                high_since_entry = opens[i+1]
+                entry_price = curr_open
+                high_since_entry = curr_open
 
-    return yearly_pnl, trades, wins
+    return yearly_pnl, trades, wins, total_win_pct, total_loss_pct
 
 # ==========================================
-# 5. CORE EVALUATOR (MEDIAN + ROBUSTNESS)
+# 5. CORE EVALUATOR (Median Return * Profit Factor)
 # ==========================================
 def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
     if p['s_ma'] >= p['l_ma']: return -999, {}, []
@@ -183,12 +200,18 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
     stock_scores = []
     total_trades_all = 0
     
-    # We also track the "Global Portfolio" just for the Kill Switch check
     portfolio_yearly_pnl = np.zeros(30, dtype=np.float64) 
+    
+    # Global Profit Factor Trackers
+    global_gross_win = 0.0
+    global_gross_loss = 0.0
+    
     valid_stocks_count = 0
 
     for ticker, data in data_store.items():
         closes = data['close']
+        
+        # Determine Indicators
         if p['t_s'] == 0: arr_s = calc_sma(closes, p['s_ma'])
         else: arr_s = calc_ema(closes, p['s_ma'])
         
@@ -198,7 +221,8 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
         if p['t_sl'] == 0: arr_sl = calc_sma(closes, p['sl_ma'])
         else: arr_sl = calc_ema(closes, p['sl_ma'])
         
-        y_pnl, tr, _ = backtest_logic_yearly(
+        # Run Backtest
+        y_pnl, tr, _, w_pct, l_pct = backtest_logic_yearly(
             data['open'], data['high'], data['low'], closes, data['years'],
             arr_s, arr_l, arr_sl, 
             p['use_tr'], p['tr_pct'], p['f_mode'], min_year
@@ -209,8 +233,10 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
             portfolio_yearly_pnl += y_pnl
             valid_stocks_count += 1
             
-            # --- INDIVIDUAL STOCK SCORING (The "Universal Soldier" Logic) ---
-            # Calculate score for THIS stock using Recency Weights
+            global_gross_win += w_pct
+            global_gross_loss += l_pct
+            
+            # --- INDIVIDUAL STOCK SCORING (Recency Weighted Return) ---
             this_score = 0.0
             for y in range(min_year, max_year + 1):
                 idx = y - min_year
@@ -222,8 +248,7 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
     if len(stock_scores) < 10 or total_trades_all < MIN_TRADES_REQUIRED:
         return -999, {}, []
 
-    # 1. KILL SWITCH (Portfolio Level)
-    # Check if the "Average Portfolio" crashed in any recent year
+    # 1. KILL SWITCH (Portfolio Safety)
     avg_portfolio_pnl = portfolio_yearly_pnl / valid_stocks_count
     
     recent_start = max_year - 5 - min_year
@@ -231,12 +256,18 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
         if avg_portfolio_pnl[i] < MAX_YEAR_DRAWDOWN:
             return -999, {}, []
 
-    # 2. FINAL SCORE = MEDIAN of Individual Scores
-    # This prevents 'Hero Stocks' from faking the results.
-    final_score = np.median(stock_scores)
+    # 2. CALCULATE PROFIT FACTOR
+    pf = global_gross_win / global_gross_loss if global_gross_loss > 0 else 1.5
+    if pf < 1.1: return -999, {}, [] # Efficiency filter
+
+    # 3. FINAL SCORE = Median Return * Profit Factor
+    # This rewards strategies that are both Universally Profitable AND Efficient
+    median_return = np.median(stock_scores)
+    final_score = median_return * pf
     
     metrics = {
         'trades': total_trades_all,
+        'pf': pf,
         'yearly_pnl': avg_portfolio_pnl
     }
     
@@ -247,16 +278,16 @@ def evaluate_params(p, data_store, yearly_weights, min_year, max_year):
 # ==========================================
 def get_neighbors(p):
     neighbors = []
-    # Tweaks for neighbors
+    # Tweaks for neighbors (Robustness Check)
     n1 = p.copy(); n1['s_ma'] = max(5, int(p['s_ma'] * 0.95)); n1['l_ma'] = max(10, int(p['l_ma'] * 0.95)); neighbors.append(n1)
     n2 = p.copy(); n2['s_ma'] = int(p['s_ma'] * 1.05); n2['l_ma'] = int(p['l_ma'] * 1.05); neighbors.append(n2)
     return neighbors
 
 # ==========================================
-# 7. MAIN
+# 7. MAIN OPTIMIZATION LOOP
 # ==========================================
 def run_robust_optimization():
-    print("--- 1. Loading Data (With Date Fix) ---")
+    print("--- 1. Loading Data ---")
     
     data_store = {}
     all_years = []
@@ -264,7 +295,7 @@ def run_robust_optimization():
     for ticker in tqdm(NIFTY_UNIVERSE):
         df = get_stock_data(ticker)
         if df is not None and len(df) > 500:
-            df['Year'] = df.index.year # NOW THIS WORKS CORRECTLY
+            df['Year'] = df.index.year 
             all_years.extend(df['Year'].unique())
             
             data_store[ticker] = {
@@ -279,12 +310,22 @@ def run_robust_optimization():
     max_year = int(max(all_years))
     print(f"Loaded {len(data_store)} stocks. Time: {min_year} -> {max_year}")
     
+    # --- NEW: PRINT WEIGHTS HERE ---
     yearly_weights = {}
+    print("\n--- 2. Allocated Year Weights (Recency Bias) ---")
+    print(f"Decay Rate: {DECAY_RATE*100}%")
     for y in range(min_year, max_year + 1):
-        age = max_year - y
-        yearly_weights[y] = 1.0 / ((1 + DECAY_RATE) ** age)
-
-    print(f"\n--- 2. Optimization (Median Logic + Kill Switch) ---")
+        if y != max_year:
+            age = max_year - y -1
+            weight = 1.0 / ((1 + DECAY_RATE) ** age)
+        else:
+            weight = 0.1
+        yearly_weights[y] = weight
+        print(f"Year {y}: {weight:.4f}")
+    
+    print("\n--- 3. Starting Optimization ---")
+    print("Strategy: Median Return * Profit Factor | Kill Switch Active")
+    
     best_score = -9999
     
     # Pre-generate random params
@@ -322,6 +363,8 @@ def run_robust_optimization():
                 f_str = ["OFF", "Price > Super", "Price < Super"][p['f_mode']]
                 ts = "EMA" if p['t_s'] else "SMA"
                 tl = "EMA" if p['t_l'] else "SMA"
+                tsl = "EMA" if p['t_sl'] else "SMA"
+                tr_str = f"{p['tr_pct']:.1f}%" if p['use_tr'] else "OFF"
                 
                 # Recent Years Display (Last 6 years)
                 rec_str = ""
@@ -332,8 +375,9 @@ def run_robust_optimization():
                         val = yearly_arr[idx] * 100
                         rec_str += f"{y}:{val:.1f}% | "
                 
-                tqdm.write(f"\n🔥 MEDIAN FIND! Score: {score:.2f} (Stability: {stability*100:.0f}%)")
-                tqdm.write(f"Params: {ts}{p['s_ma']} / {tl}{p['l_ma']} | Filter: {f_str}")
+                tqdm.write(f"\n💎 UNIVERSAL FIND! Score: {score:.2f} (PF: {metrics['pf']:.2f})")
+                tqdm.write(f"Params: {ts}{p['s_ma']} / {tl}{p['l_ma']} | Super: {tsl}{p['sl_ma']}")
+                tqdm.write(f"Filter: {f_str} | Trail: {tr_str}")
                 tqdm.write(f"Returns (Avg Stock): {rec_str}")
 
 if __name__ == "__main__":
