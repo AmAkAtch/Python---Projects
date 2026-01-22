@@ -2,7 +2,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import os
-import random
 from numba import njit
 from tqdm import tqdm
 import warnings
@@ -10,316 +9,238 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION (2026 STANDARDS)
 # ==========================================
 INDICES = {
-    'NIFTY':        {'ticker': '^NSEI',               'expiry_day': 3}, # Thursday
-    'BANKNIFTY':    {'ticker': '^NSEBANK',            'expiry_day': 2}, # Wednesday
-    'FINNIFTY':     {'ticker': 'NIFTY_FIN_SERVICE.NS', 'expiry_day': 1}, # Tuesday
-    'MIDCPNIFTY':   {'ticker': 'NIFTY_MID_SELECT.NS',  'expiry_day': 0}  # Monday
+    'NIFTY':        {'ticker': '^NSEI',               'expiry_day': 1}, 
+    'BANKNIFTY':    {'ticker': '^NSEBANK',            'expiry_day': 1}, 
+    'FINNIFTY':     {'ticker': 'NIFTY_FIN_SERVICE.NS', 'expiry_day': 1}, 
+    'MIDCPNIFTY':   {'ticker': 'NIFTY_MID_SELECT.NS',  'expiry_day': 1}, 
+    'SENSEX':       {'ticker': '^BSESN',              'expiry_day': 3}  
 }
 
-TIMEFRAMES = ['5m', '15m']
-TF_WEIGHTS = {'5m': 1.5, '15m': 1.0}
+TIMEFRAMES = ['5m'] 
+MAX_YAHOO_PERIOD = "59d"  # STRICT LIMIT: 5m data only exists for last 60 days
+NUM_ITERATIONS = 100000       
+MIN_TRADES_TOTAL = 50        
+EXIT_TIME_MINUTES = 920      
 
-# Strategy Constraints
-NUM_ITERATIONS = 50000       
-EXIT_TIME_MINUTES = 920      # 15:20 PM
-MIN_TRADES_REQUIRED = 30
-
-# OPTIONS SETTINGS (The "Synthetic" Model)
-OPTION_COST_PCT = 0.001     # Higher costs (0.1%) for Options (Spread + Brokerage)
-DELTA = 0.55                # Avg Delta for ATM/ITM winning trades
-THETA_FACTOR = 0.05         # Multiplier for time decay intensity
+OPTION_COST_PCT = 0.0012     
+DELTA = 0.55                 
 
 if not os.path.exists("data_universal"):
     os.makedirs("data_universal")
 
 # ==========================================
-# 2. DATA LOADING (Standard Spot Data)
+# 2. ROBUST DATA LOADING (FIXED)
 # ==========================================
-def clean_yfinance_data(df):
-    if df.empty: return df
-    if isinstance(df.columns, pd.MultiIndex):
-        try: df.columns = df.columns.droplevel(1) 
-        except: pass
-    df.dropna(inplace=True)
-    return df
+def load_csv_safely(file_path):
+    """
+    Attempts to load CSV. If it fails or is corrupt, returns None.
+    Uses index_col=0 to avoid 'Missing column Date' errors.
+    """
+    try:
+        # Load using first column as index, regardless of name
+        df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+        # Ensure the index is actually Datetime
+        if not isinstance(df.index, pd.DatetimeIndex):
+            df.index = pd.to_datetime(df.index, errors='coerce')
+        
+        # Drop rows where index didn't parse correctly
+        df = df[df.index.notna()]
+        
+        # Standardize index name
+        df.index.name = 'Date'
+        return df
+    except Exception as e:
+        return None
 
-def fetch_data_batch():
+def fetch_data_universe():
     data_store = {}
-    print("\n--- 1. Fetching Spot Data for Option Simulation ---")
+    print(f"--- 1. Syncing Data (Auto-Repair Mode) ---")
     
     for idx_name, info in INDICES.items():
         ticker = info['ticker']
-        for tf in TIMEFRAMES:
-            file_path = f"data_universal/{idx_name}_{tf}.csv"
-            df = None
+        file_path = f"data_universal/{idx_name}_5m.csv"
+        
+        # 1. Download Newest Data (Last 59 days)
+        try:
+            new_data = yf.download(ticker, period=MAX_YAHOO_PERIOD, interval="5m", progress=False, multi_level_index=False)
             
-            # Local Cache
-            if os.path.exists(file_path):
-                try: df = pd.read_csv(file_path, parse_dates=['Date'], index_col='Date')
-                except: df = None
+            # Clean MultiIndex headers if present
+            if isinstance(new_data.columns, pd.MultiIndex):
+                new_data.columns = new_data.columns.droplevel(1)
+            
+            # Ensure standard columns exist
+            required_cols = ['Open', 'High', 'Low', 'Close']
+            if not all(col in new_data.columns for col in required_cols):
+                print(f"⚠️ {idx_name}: Downloaded data missing columns. Skipping update.")
+                new_data = pd.DataFrame() # Empty
+            else:
+                new_data.dropna(inplace=True)
+                new_data.index.name = 'Date'
 
-            # Download
-            if df is None or len(df) < 100:
-                try:
-                    df = yf.download(ticker, period="59d", interval=tf, progress=False)
-                    df = clean_yfinance_data(df)
-                    if not df.empty and len(df) > 100: df.to_csv(file_path)
-                except: pass
+        except Exception as e:
+            print(f"❌ {idx_name}: Download error ({e})")
+            new_data = pd.DataFrame()
 
-            if df is not None and len(df) > 200:
-                times_min = df.index.hour.values * 60 + df.index.minute.values
-                weekdays = df.index.weekday.values
-                
-                data_store[f"{idx_name}|{tf}"] = {
-                    'opens': np.ascontiguousarray(df['Open'].values, dtype=np.float64),
-                    'highs': np.ascontiguousarray(df['High'].values, dtype=np.float64),
-                    'lows': np.ascontiguousarray(df['Low'].values, dtype=np.float64),
-                    'closes': np.ascontiguousarray(df['Close'].values, dtype=np.float64),
-                    'times': np.ascontiguousarray(times_min, dtype=np.int64),
-                    'weekdays': np.ascontiguousarray(weekdays, dtype=np.int64),
+        # 2. Handle Local File Storage
+        if os.path.exists(file_path):
+            old_data = load_csv_safely(file_path)
+            
+            if old_data is None or old_data.empty:
+                print(f"⚠️ {idx_name}: Local file corrupted. Deleting and starting fresh.")
+                os.remove(file_path)
+                final_df = new_data
+            else:
+                if not new_data.empty:
+                    # Append and Deduplicate
+                    final_df = pd.concat([old_data, new_data])
+                    final_df = final_df[~final_df.index.duplicated(keep='last')].sort_index()
+                else:
+                    final_df = old_data
+        else:
+            final_df = new_data
+
+        # 3. Save if valid
+        if not final_df.empty:
+            final_df.to_csv(file_path)
+            
+            # 4. Load into Memory for Backtest
+            if len(final_df) > 200:
+                print(f"✅ {idx_name}: Ready ({len(final_df)} candles)")
+                data_store[idx_name] = {
+                    'opens': np.ascontiguousarray(final_df['Open'].values, dtype=np.float64),
+                    'highs': np.ascontiguousarray(final_df['High'].values, dtype=np.float64),
+                    'lows': np.ascontiguousarray(final_df['Low'].values, dtype=np.float64),
+                    'closes': np.ascontiguousarray(final_df['Close'].values, dtype=np.float64),
+                    'times': np.ascontiguousarray(final_df.index.hour.values * 60 + final_df.index.minute.values, dtype=np.int64),
+                    'weekdays': np.ascontiguousarray(final_df.index.weekday.values, dtype=np.int64),
+                    'months': np.ascontiguousarray(final_df.index.month.values, dtype=np.int64),
                     'expiry_day': info['expiry_day'],
-                    'tf_weight': TF_WEIGHTS[tf],
-                    'interval_mins': 5 if tf == '5m' else 15
                 }
+        else:
+            print(f"❌ {idx_name}: No valid data available.")
+
     return data_store
 
 # ==========================================
-# 3. NUMBA INDICATORS
-# ==========================================
-@njit(fastmath=True, cache=True)
-def calc_ema(prices, period):
-    n = len(prices)
-    ema = np.empty(n); ema[:] = np.nan
-    if n < period: return ema
-    ema[period-1] = np.mean(prices[:period])
-    mult = 2 / (period + 1)
-    for i in range(period, n):
-        ema[i] = (prices[i] - ema[i-1]) * mult + ema[i-1]
-    return ema
-
-# ==========================================
-# 4. SYNTHETIC OPTION BACKTEST ENGINE
+# 3. NUMBA ENGINES (Optimized)
 # ==========================================
 @njit(fastmath=True)
-def backtest_options_sim(opens, highs, lows, closes, 
-                         weekdays, times_min, expiry_day_idx, interval_mins,
-                         short_ma, long_ma, super_ma, 
-                         trail_pct, target_pct): 
-    
+def calc_ma(prices, period, ma_type):
+    n = len(prices)
+    res = np.empty(n); res[:] = np.nan
+    if n < period: return res
+    if ma_type == 1: # EMA
+        res[period-1] = np.mean(prices[:period])
+        mult = 2 / (period + 1)
+        for i in range(period, n):
+            res[i] = (prices[i] - res[i-1]) * mult + res[i-1]
+    else: # SMA
+        w_sum = np.sum(prices[:period])
+        res[period-1] = w_sum / period
+        for i in range(period, n):
+            w_sum = w_sum - prices[i-period] + prices[i]
+            res[i] = w_sum / period
+    return res
+
+@njit(fastmath=True)
+def backtest_options_monthly(opens, highs, lows, closes, weekdays, times, months, expiry_day,
+                             s_ma, l_ma, sl_ma, trail, tgt, f_mode):
     n = len(closes)
-    # ROI is now based on OPTION PREMIUM, not Spot Price
-    total_option_roi = 0.0
-    
+    total_roi = 0.0
+    m_roi = np.zeros(13, dtype=np.float64)
     in_pos = False 
-    entry_spot_price = 0.0
-    high_spot_since_entry = 0.0
+    entry_px, high_px, prem, dte_entry, entry_idx = 0.0, 0.0, 0.0, 0, 0
+    trades, wins, gw, gl = 0, 0, 0.0, 0.0
     
-    # Option Simulation Vars
-    entry_premium_est = 0.0
-    days_to_expiry_entry = 0
-    entry_time_idx = 0
-    
-    trades = 0
-    wins = 0
-    gross_win_pct = 0.0
-    gross_loss_pct = 0.0
-    
-    start_idx = 300 
-    
-    for i in range(start_idx, n - 1):
-        curr_open = opens[i+1]
-        curr_high = highs[i+1]
-        curr_low = lows[i+1]
-        curr_close = closes[i+1]
-        curr_time = times_min[i+1]
-        curr_day = weekdays[i+1]
-        
-        # --- EXIT LOGIC ---
+    for i in range(300, n - 1):
         if in_pos:
-            high_spot_since_entry = max(high_spot_since_entry, curr_high)
-            should_exit = False
-            exit_spot_price = 0.0
+            high_px = max(high_px, highs[i+1])
+            stop = high_px * (1.0 - trail/100.0)
+            target = entry_px * (1.0 + tgt/100.0)
+            exit_px = 0.0
             
-            # 1. Expiry Hard Exit
-            if curr_day == expiry_day_idx and curr_time >= EXIT_TIME_MINUTES:
-                should_exit = True
-                exit_spot_price = curr_close 
+            # Exits
+            if (weekdays[i+1] == expiry_day and times[i+1] >= EXIT_TIME_MINUTES): exit_px = closes[i+1]
+            elif lows[i+1] <= stop: exit_px = stop
+            elif highs[i+1] >= target: exit_px = target
+            elif s_ma[i-1] >= l_ma[i-1] and s_ma[i] < l_ma[i]: exit_px = opens[i+1]
             
-            # 2. Spot Trailing Stop
-            if not should_exit:
-                stop_price = high_spot_since_entry * (1.0 - trail_pct / 100.0)
-                if curr_low <= stop_price:
-                    should_exit = True
-                    exit_spot_price = curr_open if curr_open < stop_price else stop_price
-            
-            # 3. Spot Target
-            if not should_exit:
-                target_price = entry_spot_price * (1.0 + target_pct / 100.0)
-                if curr_high >= target_price:
-                    should_exit = True
-                    exit_spot_price = target_price
-            
-            # 4. Cross Reversal
-            if not should_exit:
-                if short_ma[i-1] >= long_ma[i-1] and short_ma[i] < long_ma[i]:
-                    should_exit = True
-                    exit_spot_price = curr_open
-            
-            if should_exit:
-                # =========================================
-                # 💰 CALCULATE OPTION PnL
-                # =========================================
-                
-                # A. Spot Movement Points
-                spot_points = exit_spot_price - entry_spot_price
-                
-                # B. Delta Profit (Assuming 0.55 Delta)
-                option_gross_pts = spot_points * DELTA
-                
-                # C. Theta Decay (Time Penalty)
-                # Calculate minutes held
-                mins_held = (i - entry_time_idx) * interval_mins
-                if mins_held < 0: mins_held = 5 # Safety
-                
-                # Decay Rate depends on DTE (Closer to expiry = Higher decay)
-                # DTE 4 (Far) -> Decay Factor 1.0
-                # DTE 0 (Expiry) -> Decay Factor 3.0
-                dte_decay_mult = 3.0 - (days_to_expiry_entry * 0.4) 
-                if dte_decay_mult < 1.0: dte_decay_mult = 1.0
-                
-                # Decay formula: Premium * (Small Factor) * Multiplier * Duration
-                theta_loss = entry_premium_est * (0.0001 * dte_decay_mult) * mins_held
-                
-                # D. Net Option Profit
-                net_option_pts = option_gross_pts - theta_loss
-                
-                # E. ROI Calculation
-                # ROI = Net Pts / Capital Deployed (Premium) - Transaction Costs
-                trade_roi = (net_option_pts / entry_premium_est) - OPTION_COST_PCT
-                
-                total_option_roi += trade_roi
-                
-                if trade_roi > 0: 
-                    wins += 1
-                    gross_win_pct += trade_roi
-                else:
-                    gross_loss_pct += abs(trade_roi)
-                    
-                trades += 1
-                in_pos = False
+            if exit_px > 0:
+                # Option PnL Sim
+                roi = (((exit_px - entry_px) * DELTA - (prem * (0.0001 * (3.0 - dte_entry*0.4)) * ((i - entry_idx) * 5))) / prem) - OPTION_COST_PCT
+                total_roi += roi; m_roi[months[i+1]] += roi
+                if roi > 0: wins += 1; gw += roi
+                else: gl += abs(roi)
+                trades += 1; in_pos = False
 
-        # --- ENTRY LOGIC ---
-        elif not in_pos:
-            if 555 < curr_time < 900: 
-                crossover = short_ma[i-1] <= long_ma[i-1] and short_ma[i] > long_ma[i]
-                trend_ok = closes[i] > super_ma[i]
-                
-                if crossover and trend_ok:
-                    in_pos = True
-                    entry_spot_price = curr_open
-                    high_spot_since_entry = curr_open
-                    entry_time_idx = i
-                    
-                    # 🧮 ESTIMATE ATM OPTION PREMIUM
-                    # Logic: Calculate DTE (Days To Expiry)
-                    # Expiry=3 (Thu), Today=1 (Tue) -> DTE = 2
-                    dte = (expiry_day_idx - curr_day)
-                    if dte < 0: dte += 7 # Wrap around if data includes prev week
-                    days_to_expiry_entry = dte
-                    
-                    # Premium Estimation Model (Approximation)
-                    # DTE 0: 0.3% of Spot | DTE 4: 1.1% of Spot
-                    premium_pct = 0.003 + (0.002 * dte) 
-                    entry_premium_est = curr_open * premium_pct
-
-    return total_option_roi, trades, wins, gross_win_pct, gross_loss_pct
-
-# ==========================================
-# 5. UNIVERSAL OPTIMIZER (OPTION MODE)
-# ==========================================
-def run_universal_optimization():
+        elif 555 < times[i] < 900: # Entry Window
+            if s_ma[i-1] <= l_ma[i-1] and s_ma[i] > l_ma[i]:
+                t_ok = True
+                if f_mode == 1 and closes[i] <= sl_ma[i]: t_ok = False
+                if f_mode == 2 and closes[i] >= sl_ma[i]: t_ok = False
+                if t_ok:
+                    in_pos = True; entry_px = opens[i+1]; high_px = entry_px; entry_idx = i
+                    dte = (expiry_day - weekdays[i]) % 7
+                    dte_entry = dte; prem = entry_px * (0.003 + (0.002 * dte))
     
-    data_map = fetch_data_batch()
-    if not data_map:
-        print("❌ No data loaded.")
+    return total_roi, m_roi, trades, wins, gw, gl
+
+# ==========================================
+# 4. EVALUATION & OPTIMIZATION
+# ==========================================
+def evaluate(p, data):
+    if p['s_p'] >= p['l_p']: return -999, None
+    port_m_roi = np.zeros(13)
+    idx_scores, res_map = [], {}
+    t_wins, t_gw, t_gl, t_tr = 0, 0.0, 0.0, 0
+    
+    for name, d in data.items():
+        s_ma = calc_ma(d['closes'], p['s_p'], p['s_t'])
+        l_ma = calc_ma(d['closes'], p['l_p'], p['l_t'])
+        sl_ma = calc_ma(d['closes'], p['sl_p'], p['sl_t'])
+        
+        roi, m_roi, tr, w, gw, gl = backtest_options_monthly(d['opens'], d['highs'], d['lows'], d['closes'], d['weekdays'], d['times'], d['months'], d['expiry_day'], s_ma, l_ma, sl_ma, p['trail'], p['tgt'], p['f_m'])
+        
+        if roi < -0.50: return -999, None
+        idx_scores.append(roi); port_m_roi += m_roi; t_tr += tr; t_gw += gw; t_gl += gl; res_map[name] = roi
+
+    if t_tr < MIN_TRADES_TOTAL: return -999, None
+    pf = t_gw / t_gl if t_gl > 0 else 1.5
+    if pf < 1.1: return -999, None
+    
+    active_months = port_m_roi[port_m_roi != 0]
+    med_month = np.median(active_months) if len(active_months) > 0 else 0
+    
+    return np.median(idx_scores) * pf, {'pf': pf, 'tr': t_tr, 'm_roi': med_month, 'res': res_map}
+
+def run_universal_optimization():
+    data = fetch_data_universe()
+    if not data: 
+        print("❌ No valid data found after sync. Please check your internet or try again later.")
         return
 
-    keys = list(data_map.keys()) 
-    print(f"\n--- 2. Optimization Started (Option Simulation Mode) ---")
-    print("   * PnL assumes ATM Option Buy")
-    print("   * Includes simulated Delta (0.55) and Theta Decay")
+    best_score = -9999
+    print(f"\n⚡ Starting Optimization ({NUM_ITERATIONS} iterations)...")
     
-    best_weighted_score = -99999
-    best_p = {}
-    best_breakdown = {}
-
-    r_short = np.random.randint(5, 40, NUM_ITERATIONS)
-    r_long = np.random.randint(10, 80, NUM_ITERATIONS)
-    r_super = np.random.randint(50, 300, NUM_ITERATIONS)
-    r_trail = np.random.uniform(0.1, 1.5, NUM_ITERATIONS)
-    r_target = np.random.uniform(0.5, 4.0, NUM_ITERATIONS)
-
-    for i in tqdm(range(NUM_ITERATIONS), desc="Simulating Options"):
-        s_ma = r_short[i]
-        l_ma = r_long[i]
-        sl_ma = r_super[i]
-        t_pct = r_trail[i]
-        tgt_pct = r_target[i]
-
-        if s_ma >= l_ma: continue
+    for _ in tqdm(range(NUM_ITERATIONS)):
+        p = {'s_p': np.random.randint(5, 45), 'l_p': np.random.randint(15, 95), 'sl_p': np.random.randint(100, 300), 's_t': np.random.randint(0, 2), 'l_t': np.random.randint(0, 2), 'sl_t': np.random.randint(0, 2), 'trail': np.random.uniform(0.1, 1.3), 'tgt': np.random.uniform(1.0, 5.0), 'f_m': np.random.randint(0, 3)}
         
-        total_weighted_roi = 0.0
-        total_trades_all = 0
-        is_fail = False
-        current_breakdown = {}
-
-        for k in keys:
-            d = data_map[k]
+        score, met = evaluate(p, data)
+        
+        if met is not None and score > best_score:
+            best_score = score
+            st, lt, slt = ["SMA", "EMA"][p['s_t']], ["SMA", "EMA"][p['l_t']], ["SMA", "EMA"][p['sl_t']]
+            fm = ["OFF", "Price > Super", "Price < Super"][p['f_m']]
+            brk = " | ".join([f"{k}:{v*100:.1f}%" for k, v in met['res'].items()])
             
-            arr_s = calc_ema(d['closes'], s_ma)
-            arr_l = calc_ema(d['closes'], l_ma)
-            arr_sl = calc_ema(d['closes'], sl_ma)
-            
-            roi, tr, wins, g_win, g_loss = backtest_options_sim(
-                d['opens'], d['highs'], d['lows'], d['closes'],
-                d['weekdays'], d['times'], d['expiry_day'], d['interval_mins'],
-                arr_s, arr_l, arr_sl, t_pct, tgt_pct
-            )
-            
-            # Option Strategy Filter: Needs higher Profit Factor to justify risk
-            pf = g_win / g_loss if g_loss > 0 else 1.5
-            if pf < 0.8: # Options are risky, reject anything with < 0.8 PF on any chart
-                is_fail = True
-                break
-            
-            total_weighted_roi += (roi * d['tf_weight'])
-            total_trades_all += tr
-            current_breakdown[k] = f"ROI:{roi*100:.1f}%(PF:{pf:.1f})"
-
-        if not is_fail and total_trades_all > MIN_TRADES_REQUIRED:
-            if total_weighted_roi > best_weighted_score:
-                best_weighted_score = total_weighted_roi
-                best_p = {'SMA': s_ma, 'LMA': l_ma, 'Super': sl_ma, 'Trail': t_pct, 'Tgt': tgt_pct}
-                best_breakdown = current_breakdown
-                best_breakdown['Total_Trades'] = total_trades_all
-
-    print("\n" + "="*60)
-    if not best_p:
-        print("❌ No Universal Option Strategy Found.")
-        print("   Options decay killed all random strategies. Try relaxing filters.")
-    else:
-        print(f"💎 BEST UNIVERSAL OPTION STRATEGY")
-        print(f"   Score (Weighted Option ROI): {best_weighted_score:.4f}")
-        print(f"   Settings: SMA {best_p['SMA']} / LMA {best_p['LMA']} | Filter {best_p['Super']}")
-        print(f"   Risk: Spot Trail {best_p['Trail']:.2f}% | Spot Target {best_p['Tgt']:.2f}%")
-        print("-" * 60)
-        for k in sorted(best_breakdown.keys()):
-            if k != 'Total_Trades': print(f"   {k: <15} : {best_breakdown[k]}")
-        print(f"   Total Trades: {best_breakdown['Total_Trades']}")
-    print("="*60)
+            tqdm.write(f"\n🚀 NEW BEST: {score:.4f} (PF: {met['pf']:.2f})")
+            tqdm.write(f"   MA: {st}{p['s_p']} x {lt}{p['l_p']} | Filter: {fm} ({slt}{p['sl_p']})")
+            tqdm.write(f"   Exits: Trail {p['trail']:.2f}% | Target {p['tgt']:.2f}%")
+            tqdm.write(f"   Monthly Med: {met['m_roi']*100:.2f}% | Trades: {met['tr']}")
+            tqdm.write(f"   Breakdown: {brk}\n")
 
 if __name__ == "__main__":
     run_universal_optimization()
